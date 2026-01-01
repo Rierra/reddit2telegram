@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.error import BadRequest, TimedOut, NetworkError, RetryAfter
 import asyncio
 import platform
 
@@ -96,6 +97,9 @@ class PostUrlMonitor:
         
         # Message handler for URL input
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        # Global error handler
+        self.app.add_error_handler(self.error_handler)
         
     def init_database(self):
         """Initialize SQLite database for tracking state - Enhanced with chat tracking"""
@@ -350,7 +354,7 @@ class PostUrlMonitor:
         )
     
     async def list_urls_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /list command - Show posts for current chat"""
+        """Handle /list command - Show posts for current chat with pagination"""
         chat_id = update.effective_chat.id
         chat_type = update.effective_chat.type
         
@@ -361,29 +365,73 @@ class PostUrlMonitor:
             await update.message.reply_text("📭 No posts are currently being monitored in this chat.")
             return
         
-        message = f"<b>📋 Monitored Posts in this {chat_type}:</b>\n\n"
+        # Build individual post messages and split into chunks
+        MAX_MESSAGE_LENGTH = 4000  # Leave some room for safety (Telegram limit is 4096)
+        
+        header = f"<b>📋 Monitored Posts in this {chat_type}:</b>\n\n"
+        messages = []
+        current_message = header
+        
         for i, (post_id, subreddit, title, url, added_at, last_checked, _, _) in enumerate(posts, 1):
             added_date = datetime.fromtimestamp(added_at).strftime('%Y-%m-%d %H:%M')
             last_check = "Never" if not last_checked else datetime.fromtimestamp(last_checked).strftime('%H:%M:%S')
             
-            message += (
+            post_entry = (
                 f"{i}. <b>r/{subreddit}</b>\n"
-                f"   {title[:60]}{'...' if len(title) > 60 else ''}\n"
-                f"   Added: {added_date}\n"
-                f"   Last checked: {last_check}\n"
+                f"   {title[:50]}{'...' if len(title) > 50 else ''}\n"
+                f"   Added: {added_date} | Last: {last_check}\n"
                 f"   <a href='{url}'>View Post</a>\n\n"
             )
+            
+            # Check if adding this entry would exceed the limit
+            if len(current_message) + len(post_entry) > MAX_MESSAGE_LENGTH:
+                messages.append(current_message)
+                current_message = post_entry  # Start new message with this entry
+            else:
+                current_message += post_entry
         
-        # Create inline keyboard for post management
+        # Add the last message
+        if current_message:
+            messages.append(current_message)
+        
+        # Create inline keyboard for post management (split into chunks too)
         keyboard = []
         for post_id, subreddit, title, url, _, _, _, _ in posts:
+            # Shorten button text to avoid issues
+            short_title = title[:20] + '...' if len(title) > 20 else title
             keyboard.append([InlineKeyboardButton(
-                f"🗑️ Remove: r/{subreddit} - {title[:30]}...",
+                f"🗑️ r/{subreddit[:10]}: {short_title}",
                 callback_data=f"remove_{post_id}"
             )])
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(message, parse_mode='HTML', reply_markup=reply_markup)
+        # Send messages
+        try:
+            for i, msg in enumerate(messages):
+                if i == len(messages) - 1 and len(keyboard) <= 10:
+                    # Last message - attach keyboard if not too large
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=reply_markup)
+                else:
+                    await update.message.reply_text(msg, parse_mode='HTML')
+                await asyncio.sleep(0.5)  # Small delay between messages
+            
+            # If we have more than 10 posts, send keyboard separately
+            if len(keyboard) > 10:
+                await update.message.reply_text(
+                    "📝 <b>Manage posts:</b>",
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup(keyboard[:50])  # Limit to 50 buttons
+                )
+        except BadRequest as e:
+            if "too long" in str(e).lower():
+                # Fallback: send very minimal info
+                await update.message.reply_text(
+                    f"📋 You have {len(posts)} posts monitored. "
+                    f"Use the buttons below to manage them.",
+                    reply_markup=InlineKeyboardMarkup(keyboard[:20])
+                )
+            else:
+                raise
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
@@ -562,9 +610,9 @@ class PostUrlMonitor:
             logger.error(f"Failed to send Telegram alert to chat {chat_id}: {e}")
             return False
     
-    # FIX: Add async version of telegram alert
-    async def send_telegram_alert_async(self, message, chat_id):
-        """Send alert via Telegram bot (async version)"""
+    # FIX: Add async version of telegram alert with retry logic
+    async def send_telegram_alert_async(self, message, chat_id, max_retries=3):
+        """Send alert via Telegram bot (async version with retry)"""
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         payload = {
             'chat_id': chat_id,
@@ -573,17 +621,38 @@ class PostUrlMonitor:
             'disable_web_page_preview': True
         }
         
-        try:
-            # FIX: Use aiohttp for async requests
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, data=payload, timeout=10) as response:
-                    response.raise_for_status()
-                    logger.info("Telegram alert sent successfully")
-                    return True
-        except Exception as e:
-            logger.error(f"Failed to send async Telegram alert: {e}")
-            return False
+        import aiohttp
+        
+        for attempt in range(max_retries):
+            try:
+                timeout = aiohttp.ClientTimeout(total=30)  # Increased timeout
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(url, data=payload) as response:
+                        if response.status == 200:
+                            logger.info(f"Telegram alert sent successfully to chat {chat_id}")
+                            return True
+                        elif response.status == 429:  # Rate limited
+                            retry_after = int(response.headers.get('Retry-After', 5))
+                            logger.warning(f"Rate limited by Telegram. Waiting {retry_after}s...")
+                            await asyncio.sleep(retry_after)
+                        else:
+                            response.raise_for_status()
+            except asyncio.TimeoutError:
+                wait_time = (attempt + 1) * 2  # Exponential backoff: 2, 4, 6 seconds
+                logger.warning(f"Telegram request timed out (attempt {attempt + 1}/{max_retries}). Retrying in {wait_time}s...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(wait_time)
+            except aiohttp.ClientError as e:
+                wait_time = (attempt + 1) * 2
+                logger.warning(f"Network error (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(wait_time)
+            except Exception as e:
+                logger.error(f"Failed to send async Telegram alert: {e}")
+                return False
+        
+        logger.error(f"Failed to send Telegram alert after {max_retries} attempts")
+        return False
     
     def send_telegram_alert(self, message):
         """Send alert via Telegram bot (sync version)"""
@@ -603,6 +672,40 @@ class PostUrlMonitor:
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to send Telegram alert: {e}")
             return False
+    
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Global error handler for the Telegram bot"""
+        error = context.error
+        
+        # Log the error
+        logger.error(f"Exception while handling an update: {error}")
+        
+        # Handle specific error types
+        if isinstance(error, BadRequest):
+            if "message is too long" in str(error).lower():
+                logger.warning("Telegram message was too long, message truncated or split failed")
+                if update and hasattr(update, 'effective_message') and update.effective_message:
+                    try:
+                        await update.effective_message.reply_text(
+                            "⚠️ The response was too long. Please try a more specific request."
+                        )
+                    except Exception:
+                        pass
+            else:
+                logger.error(f"BadRequest error: {error}")
+        
+        elif isinstance(error, TimedOut):
+            logger.warning(f"Request timed out: {error}. This is usually temporary.")
+        
+        elif isinstance(error, NetworkError):
+            logger.warning(f"Network error: {error}. Will retry automatically.")
+        
+        elif isinstance(error, RetryAfter):
+            logger.warning(f"Rate limited by Telegram. Retry after {error.retry_after} seconds.")
+            await asyncio.sleep(error.retry_after)
+        
+        else:
+            logger.error(f"Unhandled error: {type(error).__name__}: {error}")
     
     async def rate_limit_check(self):
         """Check and enforce rate limiting (async version)"""

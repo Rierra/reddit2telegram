@@ -104,7 +104,11 @@ class PostUrlMonitor:
     def init_database(self):
         """Initialize SQLite database for tracking state - Enhanced with chat tracking"""
         try:
-            self.conn = sqlite3.connect('reddit_post_monitor.db', check_same_thread=False)
+            # Use persistent disk on Render, fallback to current directory for local dev
+            db_dir = '/data' if os.path.exists('/data') else '.'
+            db_path = os.path.join(db_dir, 'reddit_post_monitor.db')
+            logger.info(f"Using database at: {db_path}")
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
             self.cursor = self.conn.cursor()
             
             # Create tables
